@@ -80,14 +80,12 @@ async function fetchWithRetry(fn, retries = 3, delay = 2000) {
 
 // Get universe ID from place ID
 async function getUniverseId(placeId) {
-    // Primary: Official Roblox API
     try {
         const res = await fetchWithRetry(() =>
-            axiosFetch(`https://apis.roblox.com/universes/v1/places/${placeId}/universe`)
+            axiosFetch(`https://apis.roproxy.com/universes/v1/places/${placeId}/universe`)
         );
         return { universeId: res.data.universeId, gameName: null };
     } catch {
-        // Fallback: roproxy
         try {
             const res = await fetchWithRetry(() =>
                 axiosFetch(`https://games.roproxy.com/v1/games/multiget-place-details?placeIds=${placeId}`)
@@ -121,12 +119,13 @@ async function getRobloxStats(placeId, startTime) {
         const { universeId } = universeData;
 
         // Step 2: Fetch everything in parallel
+        // NOTE: correct votes endpoint is /v1/games/{universeId}/votes (NOT ?universeIds=)
         const [gameRes, voteRes, favRes, thumbRes] = await Promise.allSettled([
             fetchWithRetry(() =>
                 axiosFetch(`https://games.roproxy.com/v1/games?universeIds=${universeId}`)
             ),
             fetchWithRetry(() =>
-                axiosFetch(`https://games.roproxy.com/v1/games/votes?universeIds=${universeId}`)
+                axiosFetch(`https://games.roproxy.com/v1/games/${universeId}/votes`)
             ),
             fetchWithRetry(() =>
                 axiosFetch(`https://games.roproxy.com/v1/games/${universeId}/favorites/count`)
@@ -146,14 +145,18 @@ async function getRobloxStats(placeId, startTime) {
         const gameName = universeData.gameName || data.name;
 
         // Step 4: Extract optional data safely
-        const votes = voteRes.status === 'fulfilled' ? voteRes.value?.data?.data?.[0] : null;
+        // votes endpoint returns { upVotes, downVotes } directly (not wrapped in data[])
+        const votesRaw = voteRes.status === 'fulfilled' ? voteRes.value?.data : null;
+        const upVotes   = votesRaw?.upVotes   ?? null;
+        const downVotes = votesRaw?.downVotes ?? null;
+
         const favCount = favRes.status === 'fulfilled' ? (favRes.value?.data?.count ?? 0) : 0;
         const thumbUrl = thumbRes.status === 'fulfilled' ? (thumbRes.value?.data?.data?.[0]?.imageUrl ?? null) : null;
 
-        // Step 5: Calculate like ratio
-        const totalVotes = (votes?.upVotes ?? 0) + (votes?.downVotes ?? 0);
-        const likeRatio = votes && totalVotes > 0
-            ? ((votes.upVotes / totalVotes) * 100).toFixed(1)
+        // Step 5: Like ratio
+        const totalVotes = (upVotes ?? 0) + (downVotes ?? 0);
+        const likeRatio = upVotes != null && totalVotes > 0
+            ? ((upVotes / totalVotes) * 100).toFixed(1)
             : null;
 
         const visits = data.visits ?? 0;
@@ -165,14 +168,14 @@ async function getRobloxStats(placeId, startTime) {
             .addFields(
                 {
                     name: '👍 Likes',
-                    value: votes?.upVotes != null
-                        ? `${fmt(votes.upVotes)}${likeRatio ? ` · **${likeRatio}%**` : ''}`
+                    value: upVotes != null
+                        ? `${fmt(upVotes)}${likeRatio ? ` · **${likeRatio}%**` : ''}`
                         : 'N/A',
                     inline: true
                 },
                 {
                     name: '👎 Dislikes',
-                    value: votes?.downVotes != null ? fmt(votes.downVotes) : 'N/A',
+                    value: downVotes != null ? fmt(downVotes) : 'N/A',
                     inline: true
                 },
                 {
@@ -234,7 +237,6 @@ client.on('interactionCreate', async i => {
         return i.reply({ content: '❌ This command is restricted to the bot creator.', ephemeral: true });
     }
 
-    // /stop command
     if (i.commandName === 'stop') {
         const existing = activeIntervals.get(i.user.id);
         if (existing) {
@@ -245,7 +247,6 @@ client.on('interactionCreate', async i => {
         return i.reply({ content: '⚠️ No active tracking session found.', ephemeral: true });
     }
 
-    // /start command
     if (i.commandName === 'start') {
         const placeId = i.options.getString('id');
 
