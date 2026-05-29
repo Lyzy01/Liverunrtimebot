@@ -2,7 +2,10 @@ const { Client, GatewayIntentBits, EmbedBuilder, REST, Routes, SlashCommandBuild
 const http = require('http');
 const axios = require('axios');
 
-// 1. KEEP-ALIVE SERVER
+// --- CONFIGURATION ---
+const CREATOR_ID = '1120259838027735160'; // Your ID from the screenshot
+
+// 1. KEEP-ALIVE SERVER (For Render/UptimeRobot)
 http.createServer((req, res) => {
     res.write("Bot is running!");
     res.end();
@@ -10,14 +13,14 @@ http.createServer((req, res) => {
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
-// 2. SLASH COMMAND WITH INPUT
+// 2. SLASH COMMAND
 const commands = [
     new SlashCommandBuilder()
         .setName('start')
-        .setDescription('Track a Roblox game')
+        .setDescription('Track a Roblox game (Works with Place ID!)')
         .addStringOption(option => 
-            option.setName('gameid')
-            .setDescription('The Universe ID or Start Place ID of the game')
+            option.setName('id')
+            .setDescription('Paste the ID from the game link here')
             .setRequired(true))
 ].map(command => command.toJSON());
 
@@ -25,59 +28,68 @@ client.once('ready', async () => {
     const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
     try {
         await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
-        console.log('✅ Commands Registered');
+        console.log('✅ Bot is online and commands are ready!');
     } catch (error) { console.error(error); }
 });
 
-// 3. THE LIVE TRACKER LOGIC
+// 3. THE LOGIC
 client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
 
     if (interaction.commandName === 'start') {
-        const gameId = interaction.options.getString('gameid');
-        const startTime = `<t:${Math.floor(Date.now() / 1000)}:R>`; // Relative time for Live Time
-        
-        await interaction.reply(`🛰️ Connecting to Roblox API for ID: ${gameId}...`);
+        // Security check
+        if (interaction.user.id !== CREATOR_ID) {
+            return interaction.reply({ content: "❌ Only the bot creator can use this!", ephemeral: true });
+        }
+
+        const inputId = interaction.options.getString('id');
+        await interaction.reply(`🛰️ Processing Game ID: ${inputId}...`);
 
         const updateFeed = async () => {
             try {
-                // Fetch Game Details (Name, Creator, Status)
-                const gameRes = await axios.get(`https://games.roblox.com/v1/games?universeIds=${gameId}`);
+                // STEP 1: Automatically find UniverseID from PlaceID
+                const idUrl = `https://apis.roblox.com/universes/v1/places/${inputId}/universe`;
+                const idRes = await axios.get(idUrl);
+                const universeId = idRes.data.universeId;
+
+                // STEP 2: Fetch all the game details
+                const [gameRes, voteRes, favRes] = await Promise.all([
+                    axios.get(`https://games.roblox.com/v1/games?universeIds=${universeId}`),
+                    axios.get(`https://games.roblox.com/v1/games/votes?universeIds=${universeId}`),
+                    axios.get(`https://games.roblox.com/v1/games/${universeId}/favorites/count`)
+                ]);
+
                 const data = gameRes.data.data[0];
+                const votes = voteRes.data.data[0];
 
                 if (!data) return;
 
-                // Fetch Votes (Likes/Dislikes)
-                const voteRes = await axios.get(`https://games.roblox.com/v1/games/votes?universeIds=${gameId}`);
-                const votes = voteRes.data.data[0];
-
-                // Fetch Favorites
-                const favRes = await axios.get(`https://games.roblox.com/v1/games/${gameId}/favorites/count`);
-                const favorites = favRes.data.count;
-
                 const liveEmbed = new EmbedBuilder()
                     .setTitle(`🎮 Game: ${data.name}`)
-                    .setURL(`https://www.roblox.com/games/${data.rootPlaceId}`)
-                    .setColor(data.isPlayable ? "#00FF00" : "#FF0000")
+                    .setURL(`https://www.roblox.com/games/${inputId}`)
+                    .setColor(data.isPlayable ? "#00FF00" : "#FF1100")
+                    .setThumbnail(`https://www.roblox.com/asset-thumbnail/image?assetId=${inputId}&width=420&height=420&format=png`)
                     .addFields(
-                        { name: '👍 Likes', value: `${votes.upVotes.toLocaleString()}`, inline: true },
-                        { name: '👎 Dislikes', value: `${votes.downVotes.toLocaleString()}`, inline: true },
-                        { name: '⭐ Favorites', value: `${favorites.toLocaleString()}`, inline: true },
-                        { name: '📡 Status', value: data.isPlayable ? "🟢 Live" : "🔴 Private/Down", inline: true },
-                        { name: '👤 Game Creator', value: `By: **${data.creator.name}** (${data.creator.type})`, inline: true },
-                        { name: '📅 Date Created', value: new Date(data.created).toLocaleDateString(), inline: true },
-                        { name: '⏱️ Live Time', value: `Tracking started ${startTime}`, inline: false }
+                        { name: '👤 Creator', value: `By: **${data.creator.name}**`, inline: true },
+                        { name: '📡 Status', value: data.isPlayable ? "🟢 Live" : "🔴 Private", inline: true },
+                        { name: '👥 Active Players', value: data.playing.toLocaleString(), inline: true },
+                        { name: '👍 Likes', value: votes.upVotes.toLocaleString(), inline: true },
+                        { name: '👎 Dislikes', value: votes.downVotes.toLocaleString(), inline: true },
+                        { name: '⭐ Favorites', value: favRes.data.count.toLocaleString(), inline: true },
+                        { name: '📈 Total Visits', value: data.visits.toLocaleString(), inline: true },
+                        { name: '📅 Created On', value: new Date(data.created).toLocaleDateString(), inline: true }
                     )
-                    .setFooter({ text: "Updating every 60 seconds" })
+                    .setFooter({ text: "Updating live every 60 seconds" })
                     .setTimestamp();
 
                 await interaction.editReply({ content: '', embeds: [liveEmbed] });
             } catch (err) {
-                console.error("Roblox API Error:", err);
+                console.error(err);
+                await interaction.editReply("❌ Error: Couldn't find that game. Make sure the ID is correct!");
             }
         };
 
-        // Run immediately and then every 60 seconds
+        // Run the update immediately, then every 60 seconds
         updateFeed();
         setInterval(updateFeed, 60000); 
     }
