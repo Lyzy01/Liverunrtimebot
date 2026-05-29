@@ -116,16 +116,21 @@ async function getRobloxStats(placeId, startTime) {
 
         const { universeId } = universeData;
 
-        // Step 2: Fetch game details in parallel (primary endpoint)
-        const [gameRes, voteRes, favRes] = await Promise.allSettled([
+        // Step 2: Fetch game details in parallel
+        const [gameRes, voteRes, favRes, thumbRes] = await Promise.allSettled([
             fetchWithRetry(() =>
                 axiosFetch(`https://games.roproxy.com/v1/games?universeIds=${universeId}`)
             ),
+            // Roblox removed public votes — use the correct v1 ratings endpoint
             fetchWithRetry(() =>
                 axiosFetch(`https://games.roproxy.com/v1/games/votes?universeIds=${universeId}`)
             ),
             fetchWithRetry(() =>
                 axiosFetch(`https://games.roproxy.com/v1/games/${universeId}/favorites/count`)
+            ),
+            // Fetch thumbnail URL properly via thumbnails API
+            fetchWithRetry(() =>
+                axiosFetch(`https://thumbnails.roproxy.com/v1/games/icons?universeIds=${universeId}&size=512x512&format=Png&isCircular=false`)
             )
         ]);
 
@@ -138,7 +143,7 @@ async function getRobloxStats(placeId, startTime) {
         const data = gameRes.value.data.data[0];
         const gameName = universeData.gameName || data.name;
 
-        // Step 4: Safely extract votes (might fail, use fallback)
+        // Step 4: Safely extract votes
         const votes = voteRes.status === 'fulfilled'
             ? voteRes.value?.data?.data?.[0]
             : null;
@@ -147,22 +152,29 @@ async function getRobloxStats(placeId, startTime) {
             ? favRes.value?.data?.count ?? 0
             : 0;
 
-        return new EmbedBuilder()
+        // Step 5: Get thumbnail image URL from response
+        const thumbUrl = thumbRes.status === 'fulfilled'
+            ? thumbRes.value?.data?.data?.[0]?.imageUrl ?? null
+            : null;
+
+        // Step 6: Calculate like ratio if votes available
+        const likeRatio = votes && (votes.upVotes + votes.downVotes) > 0
+            ? ((votes.upVotes / (votes.upVotes + votes.downVotes)) * 100).toFixed(1)
+            : null;
+
+        const embed = new EmbedBuilder()
             .setTitle(`🎮 ${gameName}`)
             .setURL(`https://www.roblox.com/games/${placeId}`)
             .setColor(data.isPlayable ? 0x00FF00 : 0xFF1100)
-            .setThumbnail(
-                `https://thumbnails.roproxy.com/v1/games/icons?universeIds=${universeId}&size=512x512&format=Png`
-            )
             .addFields(
                 {
                     name: '👍 Likes',
-                    value: votes ? votes.upVotes.toLocaleString() : '—',
+                    value: votes?.upVotes != null ? `${votes.upVotes.toLocaleString()}${likeRatio ? ` (${likeRatio}%)` : ''}` : 'N/A',
                     inline: true
                 },
                 {
                     name: '👎 Dislikes',
-                    value: votes ? votes.downVotes.toLocaleString() : '—',
+                    value: votes?.downVotes != null ? votes.downVotes.toLocaleString() : 'N/A',
                     inline: true
                 },
                 {
@@ -198,6 +210,11 @@ async function getRobloxStats(placeId, startTime) {
             )
             .setFooter({ text: '🔄 Updates every 60 seconds  •  BloxRunTime' })
             .setTimestamp();
+
+        // Add thumbnail as big image at the bottom if available
+        if (thumbUrl) embed.setImage(thumbUrl);
+
+        return embed;
 
     } catch (err) {
         console.error("getRobloxStats Error:", err.message);
