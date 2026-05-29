@@ -26,7 +26,6 @@ const client = new Client({
     ]
 });
 
-// Track active intervals to prevent memory leaks
 const activeIntervals = new Map();
 
 const commands = [
@@ -53,14 +52,9 @@ client.once('ready', async () => {
     }
 });
 
-// Helper: fetch with timeout
 const axiosFetch = (url) =>
-    axios.get(url, {
-        timeout: 10000,
-        headers: { 'Accept': 'application/json' }
-    });
+    axios.get(url, { timeout: 10000, headers: { 'Accept': 'application/json' } });
 
-// Retry wrapper (up to 3 times with exponential backoff)
 async function fetchWithRetry(fn, retries = 3, delay = 2000) {
     for (let attempt = 1; attempt <= retries; attempt++) {
         try {
@@ -78,29 +72,39 @@ async function fetchWithRetry(fn, retries = 3, delay = 2000) {
     }
 }
 
-// Get universe ID from place ID
+// Try URL with roproxy first, fallback to rotunnel
+async function fetchWithFallback(path) {
+    const proxies = [
+        `https://${path.replace('roblox.com', 'roproxy.com')}`,
+        `https://${path.replace('roblox.com', 'rotunnel.com')}`,
+        `https://${path}` // direct as last resort
+    ];
+    for (const url of proxies) {
+        try {
+            const res = await axiosFetch(url);
+            return res;
+        } catch (err) {
+            console.warn(`Proxy failed (${url}): ${err.message}`);
+        }
+    }
+    throw new Error(`All proxies failed for: ${path}`);
+}
+
 async function getUniverseId(placeId) {
     try {
-        const res = await fetchWithRetry(() =>
-            axiosFetch(`https://apis.roproxy.com/universes/v1/places/${placeId}/universe`)
-        );
+        const res = await fetchWithFallback(`apis.roblox.com/universes/v1/places/${placeId}/universe`);
         return { universeId: res.data.universeId, gameName: null };
     } catch {
         try {
-            const res = await fetchWithRetry(() =>
-                axiosFetch(`https://games.roproxy.com/v1/games/multiget-place-details?placeIds=${placeId}`)
-            );
+            const res = await fetchWithFallback(`games.roblox.com/v1/games/multiget-place-details?placeIds=${placeId}`);
             if (res.data && res.data[0]) {
                 return { universeId: res.data[0].universeId, gameName: res.data[0].name };
             }
-            return null;
-        } catch {
-            return null;
-        }
+        } catch {}
+        return null;
     }
 }
 
-// Format large numbers: 1234567 -> "1.2M (1,234,567)"
 function fmt(n) {
     if (n == null) return 'N/A';
     const full = n.toLocaleString();
@@ -112,30 +116,20 @@ function fmt(n) {
 
 async function getRobloxStats(placeId, startTime) {
     try {
-        // Step 1: Get universe ID
         const universeData = await getUniverseId(placeId);
         if (!universeData) return "NOT_FOUND";
 
         const { universeId } = universeData;
 
-        // Step 2: Fetch everything in parallel
-        // NOTE: correct votes endpoint is /v1/games/{universeId}/votes (NOT ?universeIds=)
         const [gameRes, voteRes, favRes, thumbRes] = await Promise.allSettled([
-            fetchWithRetry(() =>
-                axiosFetch(`https://games.roproxy.com/v1/games?universeIds=${universeId}`)
-            ),
-            fetchWithRetry(() =>
-                axiosFetch(`https://games.roproxy.com/v1/games/${universeId}/votes`)
-            ),
-            fetchWithRetry(() =>
-                axiosFetch(`https://games.roproxy.com/v1/games/${universeId}/favorites/count`)
-            ),
-            fetchWithRetry(() =>
-                axiosFetch(`https://thumbnails.roproxy.com/v1/games/icons?universeIds=${universeId}&size=512x512&format=Png&isCircular=false`)
-            )
+            fetchWithFallback(`games.roblox.com/v1/games?universeIds=${universeId}`),
+            // Correct votes endpoint: /v1/games/{universeId}/votes
+            fetchWithFallback(`games.roblox.com/v1/games/${universeId}/votes`),
+            // Correct favorites endpoint: /v1/games/{universeId}/favorites/count
+            fetchWithFallback(`games.roblox.com/v1/games/${universeId}/favorites/count`),
+            fetchWithFallback(`thumbnails.roblox.com/v1/games/icons?universeIds=${universeId}&size=512x512&format=Png&isCircular=false`)
         ]);
 
-        // Step 3: Core game data must succeed
         if (gameRes.status === 'rejected' || !gameRes.value?.data?.data?.[0]) {
             console.error("Game data fetch failed:", gameRes.reason?.message);
             return "BLOCKED";
@@ -144,27 +138,36 @@ async function getRobloxStats(placeId, startTime) {
         const data = gameRes.value.data.data[0];
         const gameName = universeData.gameName || data.name;
 
-        // Step 4: Extract optional data safely
-        // votes endpoint returns { upVotes, downVotes } directly (not wrapped in data[])
+        // votes returns { upVotes, downVotes } directly
         const votesRaw = voteRes.status === 'fulfilled' ? voteRes.value?.data : null;
         const upVotes   = votesRaw?.upVotes   ?? null;
         const downVotes = votesRaw?.downVotes ?? null;
 
-        const favCount = favRes.status === 'fulfilled' ? (favRes.value?.data?.count ?? 0) : 0;
-        const thumbUrl = thumbRes.status === 'fulfilled' ? (thumbRes.value?.data?.data?.[0]?.imageUrl ?? null) : null;
+        // favorites returns { favoritesCount: N }  OR  { count: N } depending on endpoint
+        const favData = favRes.status === 'fulfilled' ? favRes.value?.data : null;
+        const favCount = favData?.favoritesCount ?? favData?.count ?? null;
 
-        // Step 5: Like ratio
+        const thumbUrl = thumbRes.status === 'fulfilled'
+            ? thumbRes.value?.data?.data?.[0]?.imageUrl ?? null
+            : null;
+
+        // Like ratio
         const totalVotes = (upVotes ?? 0) + (downVotes ?? 0);
         const likeRatio = upVotes != null && totalVotes > 0
             ? ((upVotes / totalVotes) * 100).toFixed(1)
             : null;
 
-        const visits = data.visits ?? 0;
+        const visits  = data.visits  ?? 0;
+        const playing = data.playing ?? 0;
+
+        // FIX: isPlayable can be false even when live on some games.
+        // Use playing > 0 as a more reliable "live" signal
+        const isLive = data.isPlayable || playing > 0;
 
         const embed = new EmbedBuilder()
             .setTitle(`🎮 ${gameName}`)
             .setURL(`https://www.roblox.com/games/${placeId}`)
-            .setColor(data.isPlayable ? 0x00FF00 : 0xFF1100)
+            .setColor(isLive ? 0x00FF00 : 0xFF1100)
             .addFields(
                 {
                     name: '👍 Likes',
@@ -180,7 +183,7 @@ async function getRobloxStats(placeId, startTime) {
                 },
                 {
                     name: '⭐ Favorites',
-                    value: fmt(favCount),
+                    value: favCount != null ? fmt(favCount) : 'N/A',
                     inline: true
                 },
                 {
@@ -190,12 +193,12 @@ async function getRobloxStats(placeId, startTime) {
                 },
                 {
                     name: '👥 Active Players',
-                    value: fmt(data.playing ?? 0),
+                    value: fmt(playing),
                     inline: true
                 },
                 {
                     name: '📡 Status',
-                    value: data.isPlayable ? '🟢 Live' : '🔴 Private/Down',
+                    value: isLive ? '🟢 Live' : '🔴 Private/Down',
                     inline: true
                 },
                 {
@@ -223,13 +226,11 @@ async function getRobloxStats(placeId, startTime) {
 
     } catch (err) {
         console.error("getRobloxStats Error:", err.message);
-        const status = err?.response?.status;
-        if (status === 404) return "NOT_FOUND";
+        if (err?.response?.status === 404) return "NOT_FOUND";
         return "BLOCKED";
     }
 }
 
-// --- INTERACTION HANDLER ---
 client.on('interactionCreate', async i => {
     if (!i.isChatInputCommand()) return;
 
@@ -283,7 +284,6 @@ client.on('interactionCreate', async i => {
     }
 });
 
-// --- PREFIX COMMANDS ---
 client.on('messageCreate', async m => {
     if (m.author.bot || m.author.id !== CREATOR_ID) return;
 
