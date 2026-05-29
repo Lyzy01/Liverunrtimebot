@@ -5,15 +5,8 @@ const axios = require('axios');
 // --- CONFIGURATION ---
 const CREATOR_ID = '1366110873248071801'; 
 
-// Keep-alive server for Render/UptimeRobot
+// Keep-alive server for Render
 http.createServer((req, res) => { res.write("Bot is awake!"); res.end(); }).listen(process.env.PORT || 3000);
-
-// Use custom headers to help bypass Roblox API blocks
-const robloxRequest = axios.create({
-    headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
-    }
-});
 
 const client = new Client({ 
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] 
@@ -36,18 +29,17 @@ client.once('ready', async () => {
 
 async function getRobloxStats(placeId, startTime) {
     try {
-        // Get Universe ID
-        const idRes = await robloxRequest.get(`https://games.roblox.com/v1/games/multiget-place-details?placeIds=${placeId}`);
+        // USING ROPROXY INSTEAD OF ROBLOX TO BYPASS BLOCKS
+        const idRes = await axios.get(`https://games.roproxy.com/v1/games/multiget-place-details?placeIds=${placeId}`);
         if (!idRes.data || !idRes.data[0]) return "NOT_FOUND";
         
         const universeId = idRes.data[0].universeId;
         const gameName = idRes.data[0].name;
 
-        // Get Votes, Favorites, and General Data
         const [gameRes, voteRes, favRes] = await Promise.all([
-            robloxRequest.get(`https://games.roblox.com/v1/games?universeIds=${universeId}`),
-            robloxRequest.get(`https://games.roblox.com/v1/games/votes?universeIds=${universeId}`),
-            robloxRequest.get(`https://games.roblox.com/v1/games/${universeId}/favorites/count`)
+            axios.get(`https://games.roproxy.com/v1/games?universeIds=${universeId}`),
+            axios.get(`https://games.roproxy.com/v1/games/votes?universeIds=${universeId}`),
+            axios.get(`https://games.roproxy.com/v1/games/${universeId}/favorites/count`)
         ]);
 
         const data = gameRes.data.data[0];
@@ -70,7 +62,7 @@ async function getRobloxStats(placeId, startTime) {
             .setFooter({ text: "Updating every 60 seconds" })
             .setTimestamp();
     } catch (err) {
-        console.error("API Error:", err.message);
+        console.error("Proxy API Error:", err.message);
         return "BLOCKED";
     }
 }
@@ -79,7 +71,7 @@ client.on('interactionCreate', async i => {
     if (!i.isChatInputCommand() || i.user.id !== CREATOR_ID) return;
 
     const placeId = i.options.getString('id');
-    const startTime = Math.floor(Date.now() / 1000); // Set start time for "Live Time"
+    const startTime = Math.floor(Date.now() / 1000); 
     
     await i.deferReply();
 
@@ -88,7 +80,7 @@ client.on('interactionCreate', async i => {
         if (result instanceof EmbedBuilder) {
             await i.editReply({ content: '', embeds: [result] });
         } else {
-            await i.editReply("❌ Roblox API is currently blocking the request. Waiting for cooldown...");
+            await i.editReply("❌ Error: Game not found or Proxy is currently down.");
         }
     };
 
@@ -105,7 +97,7 @@ client.on('messageCreate', async m => {
         const startTime = Math.floor(Date.now() / 1000);
         const result = await getRobloxStats(placeId, startTime);
         if (result instanceof EmbedBuilder) m.reply({ embeds: [result] });
-        else m.reply("❌ API Error. Check the ID or wait 5 mins.");
+        else m.reply("❌ Error fetching data.");
     }
 });
 
