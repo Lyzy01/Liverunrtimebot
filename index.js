@@ -3,7 +3,7 @@ const http = require('http');
 const axios = require('axios');
 
 // --- YOUR CONFIG ---
-const CREATOR_ID = '1120259838027735160'; 
+const CREATOR_ID = '1366110873248071801'; 
 
 http.createServer((req, res) => { res.write("Bot is running!"); res.end(); }).listen(process.env.PORT || 3000);
 
