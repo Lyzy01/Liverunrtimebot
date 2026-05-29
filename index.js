@@ -26,8 +26,8 @@ const client = new Client({
     ]
 });
 
-// --- FIX #3: Track active intervals to prevent memory leaks ---
-const activeIntervals = new Map(); // userId -> intervalId
+// Track active intervals to prevent memory leaks
+const activeIntervals = new Map();
 
 const commands = [
     new SlashCommandBuilder()
@@ -53,14 +53,14 @@ client.once('ready', async () => {
     }
 });
 
-// --- FIX #1: Helper to fetch with timeout ---
+// Helper: fetch with timeout
 const axiosFetch = (url) =>
     axios.get(url, {
         timeout: 10000,
         headers: { 'Accept': 'application/json' }
     });
 
-// --- FIX #2: Retry wrapper (retries up to 3 times with 2s delay) ---
+// Retry wrapper (up to 3 times with exponential backoff)
 async function fetchWithRetry(fn, retries = 3, delay = 2000) {
     for (let attempt = 1; attempt <= retries; attempt++) {
         try {
@@ -68,12 +68,9 @@ async function fetchWithRetry(fn, retries = 3, delay = 2000) {
         } catch (err) {
             const status = err?.response?.status;
             console.warn(`⚠️ Attempt ${attempt} failed (HTTP ${status || 'N/A'}): ${err.message}`);
-
-            // Don't retry on 404 (game not found)
             if (status === 404) throw err;
-
             if (attempt < retries) {
-                await new Promise(r => setTimeout(r, delay * attempt)); // exponential backoff
+                await new Promise(r => setTimeout(r, delay * attempt));
             } else {
                 throw err;
             }
@@ -81,7 +78,7 @@ async function fetchWithRetry(fn, retries = 3, delay = 2000) {
     }
 }
 
-// --- FIX #1: Use official Roblox APIs + fallback proxy ---
+// Get universe ID from place ID
 async function getUniverseId(placeId) {
     // Primary: Official Roblox API
     try {
@@ -96,16 +93,23 @@ async function getUniverseId(placeId) {
                 axiosFetch(`https://games.roproxy.com/v1/games/multiget-place-details?placeIds=${placeId}`)
             );
             if (res.data && res.data[0]) {
-                return {
-                    universeId: res.data[0].universeId,
-                    gameName: res.data[0].name
-                };
+                return { universeId: res.data[0].universeId, gameName: res.data[0].name };
             }
             return null;
         } catch {
             return null;
         }
     }
+}
+
+// Format large numbers: 1234567 -> "1.2M (1,234,567)"
+function fmt(n) {
+    if (n == null) return 'N/A';
+    const full = n.toLocaleString();
+    if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B (${full})`;
+    if (n >= 1_000_000)     return `${(n / 1_000_000).toFixed(1)}M (${full})`;
+    if (n >= 1_000)         return `${(n / 1_000).toFixed(1)}K (${full})`;
+    return full;
 }
 
 async function getRobloxStats(placeId, startTime) {
@@ -116,25 +120,23 @@ async function getRobloxStats(placeId, startTime) {
 
         const { universeId } = universeData;
 
-        // Step 2: Fetch game details in parallel
+        // Step 2: Fetch everything in parallel
         const [gameRes, voteRes, favRes, thumbRes] = await Promise.allSettled([
             fetchWithRetry(() =>
                 axiosFetch(`https://games.roproxy.com/v1/games?universeIds=${universeId}`)
             ),
-            // Roblox removed public votes — use the correct v1 ratings endpoint
             fetchWithRetry(() =>
                 axiosFetch(`https://games.roproxy.com/v1/games/votes?universeIds=${universeId}`)
             ),
             fetchWithRetry(() =>
                 axiosFetch(`https://games.roproxy.com/v1/games/${universeId}/favorites/count`)
             ),
-            // Fetch thumbnail URL properly via thumbnails API
             fetchWithRetry(() =>
                 axiosFetch(`https://thumbnails.roproxy.com/v1/games/icons?universeIds=${universeId}&size=512x512&format=Png&isCircular=false`)
             )
         ]);
 
-        // Step 3: Check if core game data succeeded
+        // Step 3: Core game data must succeed
         if (gameRes.status === 'rejected' || !gameRes.value?.data?.data?.[0]) {
             console.error("Game data fetch failed:", gameRes.reason?.message);
             return "BLOCKED";
@@ -143,24 +145,18 @@ async function getRobloxStats(placeId, startTime) {
         const data = gameRes.value.data.data[0];
         const gameName = universeData.gameName || data.name;
 
-        // Step 4: Safely extract votes
-        const votes = voteRes.status === 'fulfilled'
-            ? voteRes.value?.data?.data?.[0]
+        // Step 4: Extract optional data safely
+        const votes = voteRes.status === 'fulfilled' ? voteRes.value?.data?.data?.[0] : null;
+        const favCount = favRes.status === 'fulfilled' ? (favRes.value?.data?.count ?? 0) : 0;
+        const thumbUrl = thumbRes.status === 'fulfilled' ? (thumbRes.value?.data?.data?.[0]?.imageUrl ?? null) : null;
+
+        // Step 5: Calculate like ratio
+        const totalVotes = (votes?.upVotes ?? 0) + (votes?.downVotes ?? 0);
+        const likeRatio = votes && totalVotes > 0
+            ? ((votes.upVotes / totalVotes) * 100).toFixed(1)
             : null;
 
-        const favCount = favRes.status === 'fulfilled'
-            ? favRes.value?.data?.count ?? 0
-            : 0;
-
-        // Step 5: Get thumbnail image URL from response
-        const thumbUrl = thumbRes.status === 'fulfilled'
-            ? thumbRes.value?.data?.data?.[0]?.imageUrl ?? null
-            : null;
-
-        // Step 6: Calculate like ratio if votes available
-        const likeRatio = votes && (votes.upVotes + votes.downVotes) > 0
-            ? ((votes.upVotes / (votes.upVotes + votes.downVotes)) * 100).toFixed(1)
-            : null;
+        const visits = data.visits ?? 0;
 
         const embed = new EmbedBuilder()
             .setTitle(`🎮 ${gameName}`)
@@ -169,22 +165,29 @@ async function getRobloxStats(placeId, startTime) {
             .addFields(
                 {
                     name: '👍 Likes',
-                    value: votes?.upVotes != null ? `${votes.upVotes.toLocaleString()}${likeRatio ? ` (${likeRatio}%)` : ''}` : 'N/A',
+                    value: votes?.upVotes != null
+                        ? `${fmt(votes.upVotes)}${likeRatio ? ` · **${likeRatio}%**` : ''}`
+                        : 'N/A',
                     inline: true
                 },
                 {
                     name: '👎 Dislikes',
-                    value: votes?.downVotes != null ? votes.downVotes.toLocaleString() : 'N/A',
+                    value: votes?.downVotes != null ? fmt(votes.downVotes) : 'N/A',
                     inline: true
                 },
                 {
                     name: '⭐ Favorites',
-                    value: favCount.toLocaleString(),
+                    value: fmt(favCount),
                     inline: true
                 },
                 {
-                    name: '🎮 Active Players',
-                    value: (data.playing ?? 0).toLocaleString(),
+                    name: '🕹️ Visits',
+                    value: fmt(visits),
+                    inline: true
+                },
+                {
+                    name: '👥 Active Players',
+                    value: fmt(data.playing ?? 0),
                     inline: true
                 },
                 {
@@ -211,14 +214,12 @@ async function getRobloxStats(placeId, startTime) {
             .setFooter({ text: '🔄 Updates every 60 seconds  •  BloxRunTime' })
             .setTimestamp();
 
-        // Add thumbnail as big image at the bottom if available
         if (thumbUrl) embed.setImage(thumbUrl);
 
         return embed;
 
     } catch (err) {
         console.error("getRobloxStats Error:", err.message);
-        // Differentiate error types
         const status = err?.response?.status;
         if (status === 404) return "NOT_FOUND";
         return "BLOCKED";
@@ -229,7 +230,6 @@ async function getRobloxStats(placeId, startTime) {
 client.on('interactionCreate', async i => {
     if (!i.isChatInputCommand()) return;
 
-    // Only allow creator
     if (i.user.id !== CREATOR_ID) {
         return i.reply({ content: '❌ This command is restricted to the bot creator.', ephemeral: true });
     }
@@ -249,12 +249,10 @@ client.on('interactionCreate', async i => {
     if (i.commandName === 'start') {
         const placeId = i.options.getString('id');
 
-        // Validate that placeId is numeric
         if (!/^\d+$/.test(placeId)) {
-            return i.reply({ content: '❌ Invalid Place ID. It should be a number only (e.g. `6872265039`).', ephemeral: true });
+            return i.reply({ content: '❌ Invalid Place ID. Must be numbers only (e.g. `6872265039`).', ephemeral: true });
         }
 
-        // Stop any existing interval for this user
         const existing = activeIntervals.get(i.user.id);
         if (existing) clearInterval(existing);
 
@@ -267,50 +265,35 @@ client.on('interactionCreate', async i => {
                 if (result instanceof EmbedBuilder) {
                     await i.editReply({ content: '', embeds: [result] });
                 } else if (result === "NOT_FOUND") {
-                    await i.editReply({
-                        content: '❌ Game not found. Please check the Place ID and try again.',
-                        embeds: []
-                    });
-                    // Stop tracking if game doesn't exist
+                    await i.editReply({ content: '❌ Game not found. Check the Place ID.', embeds: [] });
                     const interval = activeIntervals.get(i.user.id);
-                    if (interval) {
-                        clearInterval(interval);
-                        activeIntervals.delete(i.user.id);
-                    }
+                    if (interval) { clearInterval(interval); activeIntervals.delete(i.user.id); }
                 } else {
-                    // BLOCKED — don't stop, just show warning and retry next tick
-                    await i.editReply({
-                        content: '⚠️ Roblox API is temporarily unavailable. Retrying next update...',
-                        embeds: []
-                    });
+                    await i.editReply({ content: '⚠️ Roblox API temporarily unavailable. Retrying next update...', embeds: [] });
                 }
             } catch (err) {
                 console.error("Refresh error:", err.message);
             }
         };
 
-        // Run immediately, then every 60s
         await refresh();
         const intervalId = setInterval(refresh, 60000);
         activeIntervals.set(i.user.id, intervalId);
     }
 });
 
-// --- PREFIX COMMAND: !update ---
+// --- PREFIX COMMANDS ---
 client.on('messageCreate', async m => {
     if (m.author.bot || m.author.id !== CREATOR_ID) return;
 
     if (m.content.startsWith('!update')) {
         const placeId = m.content.split(' ')[1];
-
         if (!placeId || !/^\d+$/.test(placeId)) {
             return m.reply('❌ Usage: `!update <placeId>` — Place ID must be a number.');
         }
-
         const startTime = Math.floor(Date.now() / 1000);
         const loadingMsg = await m.reply('🔄 Fetching game data...');
         const result = await getRobloxStats(placeId, startTime);
-
         if (result instanceof EmbedBuilder) {
             await loadingMsg.edit({ content: '', embeds: [result] });
         } else if (result === "NOT_FOUND") {
